@@ -1,13 +1,15 @@
-# 06 · 多模型适配层设计
+# 06 · 模型 Provider 插件设计（适配层）
+
+> 本文档面向的是一类插件：**模型 Provider 插件**。它实现内核 `llm` 服务的具体分发目标，是"底座 + 插件"架构下的第一个插件类型。插件契约本身见 [09-插件体系设计](09-插件体系设计.md)。
 
 ## 1. 目标与职责
 
-把不同厂商（OpenAI / Anthropic / Google / DeepSeek / Kimi / 通义 / Ollama…）的 SDK 差异收敛为**一个统一接口**，业务层（聊天服务）只面向抽象编程：
+把不同厂商（OpenAI / Anthropic / Google / DeepSeek / Kimi / 通义 / Ollama…）的 SDK 差异收敛为**对内核统一的服务接口**，业务层（core-chat 插件）只面向 `llm` 服务编程：
 
 1. 统一的流式对话入口（SSE 转发）
 2. 统一的模型能力声明与校验
-3. 统一的配置来源（providers 表）
-4. API Key 只在服务端可见
+3. 配置经内核 `config` 服务（密钥加密落库）
+4. API Key 只在服务端内存中可见
 
 ## 2. 核心抽象
 
@@ -50,36 +52,41 @@ type FinishReason = 'stop' | 'aborted' | 'error' | 'length'
 
 前端 `GET /api/models` 拿到能力标注后，联动 UI：不支持 vision 时隐藏/禁用图片上传；超长的会话给出"已自动裁剪历史"提示。
 
-### 2.3 Provider 工厂
+### 2.3 实现方式：每个厂商一个插件
+
+Provider 插件在 apply 时向内核注册命名空间服务 `llm:provider/<name>`，并向 `models` 聚合服务贡献模型清单：
 
 ```ts
-function createProvider(cfg: ProviderConfig): ChatProvider {
-  switch (cfg.protocol) {
-    case 'openai-compatible':  // OpenAI / DeepSeek / Kimi / 通义 / Ollama / vLLM
-      return new OpenAICompatibleProvider(cfg)   // 基于 @ai-sdk/openai 的 custom provider
-    case 'anthropic':
-      return new AnthropicProvider(cfg)          // @ai-sdk/anthropic
-    case 'google':
-      return new GoogleProvider(cfg)             // @ai-sdk/google
-    default:
-      throw new UnsupportedProtocolError(cfg.protocol)
+export default {
+  manifest: {
+    name: 'plugin-deepseek',
+    using: ['config', 'events'],
+    provides: ['llm:provider/deepseek'],
+    config: [ /* apiKey(baseUrl, models 清单等，见 09 文档 §2 */ ],
+  },
+  apply(ctx) {
+    // 经 config 服务读取 apiKey（服务端解密），构造 SDK 客户端
+    // 注册服务：ctx.provide('llm:provider/deepseek', { stream, embed, listModels })
+    return () => { /* dispose：关闭连接等 */ }
   }
 }
 ```
 
-> 关键点：`protocol` 而非 `vendor` 决定实现。绝大多数国产模型兼容 OpenAI 协议，直接复用 `createOpenAI({ baseURL, apiKey, compatibility: 'compatible' })`，这是多模型聚合能低成本实现的根本原因。
+- **按协议而非厂商选择实现**：绝大多数国产模型兼容 OpenAI 协议，插件内部复用 `createOpenAI({ baseURL, apiKey, compatibility: 'compatible' })`，这是多模型聚合能低成本实现的根本原因。
+- 同一个 OpenAI 兼容实现可被多个厂商插件复用（共享代码包），每个厂商插件只负责自己的配置项与模型清单。
 
 ## 3. 配置管理
 
 ### 3.1 存储与加密
 
-- `providers` 表存 `base_url`、**加密的** `api_key_encrypted`（AES-256-GCM，主密钥来自环境变量 `APP_SECRET`，不落库）。
-- 对外接口一律脱敏（掩码 `sk-****abcd`）；`PATCH` 时 key 字段留空 = 不修改。
+- 插件配置经内核 `config` 服务落库，apiKey 等 secret 类型字段**加密存储**（AES-256-GCM，主密钥来自环境变量 `APP_SECRET`）。
+- 对外接口一律脱敏（掩码 `sk-****abcd`）；更新时 key 字段留空 = 不修改。
+- `models` 聚合服务对所有 provider 插件的模型清单做汇总，前端选择器数据来源于此。
 
 ### 3.2 启动时缓存
 
-- 服务启动加载 providers → models 到内存缓存（Map），每次聊天从缓存取配置并构造 provider 实例（构造开销极小，无需池化）。
-- 配置变更接口负责失效缓存，避免每次查询打库。
+- 各 provider 插件在 apply 时注册服务实现并声明模型清单；`llm` 内核服务维护 `modelId → provider 插件` 的路由表，聊天请求按会话所选模型分发。
+- 插件配置变更（`plugin/settings-changed` 事件）→ 相关插件重建客户端，路由表同步更新，避免每次请求打库。
 
 ### 3.3 模型清单来源
 
@@ -119,6 +126,6 @@ type ChatMessage = {
 
 ## 6. 演进预留
 
-- **Embedding 也走适配层**：`embed(texts: string[]): Promise<number[][]>`，OpenAI 兼容协议同样覆盖 embedding，接口对称。
+- **Embedding 走同一插件服务**：provider 插件同时实现 `embed(texts): Promise<number[][]>`，OpenAI 兼容协议同样覆盖 embedding；知识库插件经内核 `llm/embed` 调用，不感知厂商。
 - **Tool calling 预留**：`StreamRequest.tools` 字段预留但阶段一不实现；`ai` SDK 协议层已支持，加功能时不动接口。
-- **本地模型（Ollama）**：即一个 `openai-compatible` provider，baseURL 指向 `http://localhost:11434/v1`，零代码接入——只需在文档中给出配置示例。
+- **本地模型（Ollama）**：即一个 `openai-compatible` provider 插件，baseURL 指向 `http://localhost:11434/v1`，零代码接入——只需在文档中给出配置示例。

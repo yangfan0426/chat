@@ -128,10 +128,12 @@ data: {"usage": {"promptTokens": 1, "completionTokens": 2}, "finishReason": "sto
 
 **错误**：会话不存在 `404`；会话绑定的模型已删除 `422 MODEL_UNAVAILABLE`。
 
-## 3. 模型与服务商配置
+## 3. 模型与插件配置
+
+> 插件架构下的配置模型：模型能力由已挂载的 Provider 插件声明；服务商连接信息是 provider 插件的 `config`（经配置中心加密存储）。底座提供统一的**插件配置读写接口**，不再为服务商单独设计 API。
 
 ### `GET /api/models`
-当前可用模型列表（供前端选择器；**不含任何密钥信息**）。
+当前可用模型列表（`models` 聚合服务汇总所有 provider 插件的声明；**不含任何密钥信息**）。
 
 **响应 200**
 ```json
@@ -140,7 +142,7 @@ data: {"usage": {"promptTokens": 1, "completionTokens": 2}, "finishReason": "sto
     {
       "id": "deepseek-chat",
       "label": "DeepSeek Chat",
-      "provider": "deepseek",
+      "provider": "plugin-deepseek",
       "capabilities": { "vision": false, "contextWindow": 64000 },
       "isDefault": true
     }
@@ -148,27 +150,27 @@ data: {"usage": {"promptTokens": 1, "completionTokens": 2}, "finishReason": "sto
 }
 ```
 
-### `GET /api/providers`
-服务商列表（脱敏，key 仅返回掩码 `sk-****abcd`）。
+### `GET /api/plugins`
+已加载插件清单（名称、版本、描述、状态），供前端渲染插件管理与设置入口。
 
-### `POST /api/providers`
-新增服务商。
-
-**请求**
+**响应 200**
 ```json
 {
-  "name": "deepseek",
-  "baseUrl": "https://api.deepseek.com/v1",
-  "apiKey": "sk-...",
-  "models": [
-    { "id": "deepseek-chat", "label": "DeepSeek Chat", "vision": false, "contextWindow": 64000 }
-  ],
-  "embeddingModel": { "id": "...", "dimension": 1536 }
+  "data": [
+    { "name": "plugin-deepseek", "version": "0.1.0", "status": "active", "description": "..." }
+  ]
 }
 ```
 
-### `PATCH /api/providers/:id` / `DELETE /api/providers/:id`
-修改（apiKey 留空表示不修改）/ 删除（校验无会话引用该 provider 下模型）。
+### `GET /api/plugins/:name/config`
+读取插件配置。响应按 manifest `config` 声明逐项给出 `{ key, label, type, value }`；**secret 类型值脱敏返回**（如 `sk-****abcd`）。
+
+### `PUT /api/plugins/:name/config`
+写入插件配置。body 为 `{ key: value }` 键值对；secret 字段传空串表示不修改。写入后内核发布 `plugin/settings-changed` 事件，插件自行热更新（如重建客户端）。
+
+**响应**：更新后的配置（同 GET 的脱敏格式）。
+
+**错误**：插件不存在 `404`；key 未在 manifest 声明 `400 INVALID_REQUEST`。
 
 ## 4. 知识库
 
